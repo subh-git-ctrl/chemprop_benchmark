@@ -93,13 +93,13 @@ elif command -v conda &> /dev/null; then
 fi
 
 if [ $ENV_FOUND -eq 1 ]; then
-    # Try activating qpred first, then chemprop
-    if conda info --envs | grep -q "^qpred "; then
-        conda activate qpred
-        echo "[Environment] Activated conda environment: qpred"
-    elif conda info --envs | grep -q "^chemprop "; then
+    # Prioritize chemprop environment (Python 3.11+), fallback to qpred
+    if conda info --envs | grep -q "^chemprop "; then
         conda activate chemprop
         echo "[Environment] Activated conda environment: chemprop"
+    elif conda info --envs | grep -q "^qpred "; then
+        conda activate qpred
+        echo "[Environment] Activated conda environment: qpred"
     fi
 fi
 
@@ -115,6 +115,16 @@ if [ -z "$CONDA_DEFAULT_ENV" ]; then
 fi
 
 echo "[Environment] Python executable: $(which python3 || which python)"
+
+# Validate Python version >= 3.10
+if ! python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" &>/dev/null; then
+    CURRENT_PY=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "unknown")
+    echo "=================================================================="
+    echo " ERROR: Python $CURRENT_PY is incompatible with Chemprop."
+    echo " Chemprop requires Python 3.10 or higher."
+    echo "=================================================================="
+    exit 1
+fi
 
 # Check if chemprop is installed in the active environment; install if missing
 if ! python3 -c "import chemprop" &>/dev/null; then
