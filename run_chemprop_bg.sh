@@ -116,6 +116,19 @@ fi
 
 echo "[Environment] Python executable: $(which python3 || which python)"
 
+# Check if chemprop is installed in the active environment; install if missing
+if ! python3 -c "import chemprop" &>/dev/null; then
+    echo "[Setup] chemprop not found in current environment. Installing with 'pip install -e chemprop'..."
+    pip install -e "$SCRIPT_DIR/chemprop"
+fi
+
+# Determine Chemprop executable command
+if command -v chemprop &> /dev/null; then
+    TRAIN_RUNNER="chemprop train"
+else
+    TRAIN_RUNNER="python3 -m chemprop.cli train"
+fi
+
 # ------------------------------------------------------------------------------
 # 2. Dataset Verification
 # ------------------------------------------------------------------------------
@@ -161,7 +174,7 @@ echo "=================================================================="
 # Symlink latest log for convenience
 ln -sf "$LOG_FILE" "$LATEST_LOG"
 
-nohup python3 -m chemprop.cli train \
+nohup $TRAIN_RUNNER \
     -i "$TRAIN_CSV" "$VAL_CSV" "$TEST_CSV" \
     --smiles-columns smile \
     --target-columns "$PROPERTY" \
