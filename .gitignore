@@ -1,0 +1,28 @@
+# Python & environments
+venv/
+.venv/
+chemprop/venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Training artifacts & logs
+logs/
+checkpoints/
+*.log
+*.err
+*.pid
+
+# Large QM40 raw 3D coordinate and bond files (>100MB exceeds GitHub hard limit)
+# Note: main.csv (~35MB) and compare split files (~23MB) are kept and tracked
+data_qm40/bond.csv
+data_qm40/xyz.csv
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

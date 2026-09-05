@@ -1,0 +1,21 @@
+name: chemprop
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11
+  - pip
+  - pytorch>=2.1
+  - astartes
+  - aimsim
+  - configargparse
+  - lightning>=2.0
+  - numpy
+  - pandas
+  - rdkit
+  - cuik_molmaker >=0.3
+  - scikit-learn
+  - scipy
+  - rich
+  - descriptastorus
+  - pydantic
+  - myerson>=1.0.1
