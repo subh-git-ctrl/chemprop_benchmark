@@ -181,30 +181,87 @@ def generate_report(qpred_path, chemprop_path, output_dir=None, target_property=
     
     return metrics
 
+def detect_column(df, candidates):
+    """Return the first candidate column present in df, else None."""
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
 if __name__ == '__main__':
-    # Default paths (adjust based on your file locations)
+    import argparse
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    
-    qpred_pred_path = os.path.join(script_dir, 'qpred_predictions.csv')
-    chemprop_pred_path = os.path.join(script_dir, 'chemprop_predictions.csv')
-    
-    # Check if files exist
-    if not os.path.exists(qpred_pred_path):
-        print(f"ERROR: QPred predictions file not found: {qpred_pred_path}")
-        print("Please provide QPred test predictions in CSV format")
+
+    parser = argparse.ArgumentParser(
+        description="Compare QPred vs Chemprop test predictions (works for any QM40 property)."
+    )
+    parser.add_argument('--qpred', default=os.path.join(script_dir, 'qpred_predictions.csv'),
+                        help='QPred predictions CSV (columns: Zinc_id, actual, predicted)')
+    parser.add_argument('--chemprop', default=os.path.join(script_dir, 'chemprop_predictions.csv'),
+                        help='Chemprop predictions CSV (from `chemprop predict` or `chemprop train`)')
+    parser.add_argument('--target-property', default='Polarizability',
+                        help='Property label used in the report (e.g. HOMO, HL_gap)')
+    parser.add_argument('--id-column', default='Zinc_id')
+    parser.add_argument('--y-true-column', default='actual',
+                        help="Ground-truth column in the QPred file (falls back to the target property column name)")
+    parser.add_argument('--qpred-pred-col', default='auto',
+                        help="QPred prediction column (default auto: 'predicted', the target name, 'pred_0', 'prediction')")
+    parser.add_argument('--chemprop-pred-col', default='auto',
+                        help="Chemprop prediction column (default auto: 'prediction', 'pred_0', the target name, ...)")
+    parser.add_argument('--output-dir', default=script_dir)
+    args = parser.parse_args()
+
+    for f in (args.qpred, args.chemprop):
+        if not os.path.exists(f):
+            print(f"ERROR: predictions file not found: {f}")
+            sys.exit(1)
+
+    # Resolve columns that may be named differently across files/layouts
+    qpred_df = pd.read_csv(args.qpred)
+    chemprop_df = pd.read_csv(args.chemprop)
+    prop = args.target_property
+
+    y_true_col = args.y_true_column
+    if y_true_col not in qpred_df.columns:
+        y_true_col = detect_column(qpred_df, [prop])
+        if y_true_col is None:
+            print(f"ERROR: neither '{args.y_true_column}' nor '{prop}' found in {args.qpred} "
+                  f"(columns: {list(qpred_df.columns)})")
+            sys.exit(1)
+
+    if args.qpred_pred_col == 'auto':
+        qpred_col = detect_column(qpred_df, ['predicted', prop, 'pred_0', 'prediction'])
+    else:
+        qpred_col = args.qpred_pred_col
+    if not qpred_col or qpred_col not in qpred_df.columns:
+        print(f"ERROR: could not find QPred prediction column in {args.qpred} "
+              f"(columns: {list(qpred_df.columns)})")
         sys.exit(1)
-    
-    if not os.path.exists(chemprop_pred_path):
-        print(f"ERROR: Chemprop predictions file not found: {chemprop_pred_path}")
-        print("Please provide Chemprop test predictions in CSV format")
+
+    if args.chemprop_pred_col == 'auto':
+        chemprop_col = detect_column(chemprop_df, ['prediction', 'pred_0', 'predicted', 'predictions', prop])
+    else:
+        chemprop_col = args.chemprop_pred_col
+    if not chemprop_col or chemprop_col not in chemprop_df.columns:
+        print(f"ERROR: could not find Chemprop prediction column in {args.chemprop} "
+              f"(columns: {list(chemprop_df.columns)})")
         sys.exit(1)
-    
+
+    print(f"Using columns  ->  QPred truth: '{y_true_col}', QPred pred: '{qpred_col}', "
+          f"Chemprop pred: '{chemprop_col}'")
+
     # Generate report
     metrics = generate_report(
-        qpred_pred_path,
-        chemprop_pred_path,
-        output_dir=script_dir,
-        target_property='Polarizability'
+        args.qpred,
+        args.chemprop,
+        output_dir=args.output_dir,
+        target_property=prop,
+        id_column=args.id_column,
+        y_true_column=y_true_col,
+        qpred_pred_col=qpred_col,
+        chemprop_pred_col=chemprop_col,
     )
-    
+
     print("\n✓ Comparison complete!")

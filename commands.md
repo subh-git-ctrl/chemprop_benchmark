@@ -211,8 +211,14 @@ python compare/chemprop_qpred_style_mae.py \
 Put QPred's test predictions in `compare/qpred_predictions.csv` with columns `Zinc_id,actual,predicted`, then:
 
 ```bash
+# Default (files in compare/, label Polarizability):
 cd compare && python compare_predictions.py && cd ..
+
+# Any other property — pass the label and (optionally) column overrides:
+cd compare && python compare_predictions.py --target-property HOMO && cd ..
 ```
+
+The script auto-detects the prediction columns (`predicted`/`pred_0`/target-name for QPred and Chemprop files respectively); see `--help` for overrides.
 
 ---
 
