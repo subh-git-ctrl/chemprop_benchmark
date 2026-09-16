@@ -1,170 +1,158 @@
 # Chemprop QM40 VM Training & Execution Guide
 
-This document contains all the commands required to set up, train, monitor, and evaluate Chemprop on a VM for the QM40 dataset benchmark.
+Everything needed to set up, train, monitor, and evaluate **Chemprop** on the QM40 dataset for comparison against your QPred model — with **one command**.
 
 ---
 
-## 1. Quick Start (Background Training on VM)
-
-Run training in the background with `nohup` and `disown` so it **keeps running to completion even after you close your terminal or disconnect from the VM**.
-
-> **Note:** The script trains on the **ENTIRE QM40 dataset** (all **110,000** training molecules, **10,000** validation molecules, and **42,956** test molecules). The default `batch_size` (64 or 32) is simply the **GPU mini-batch size** (how many molecules are fed per gradient step), not the dataset size.
+## 1. Quick Start (One Command)
 
 ```bash
-# Give execution permission
-chmod +x run_chemprop_bg.sh run_property_bg.sh
+chmod +x run_chemprop_bg.sh run_property_bg.sh stop_chemprop.sh
 
-# Train on Polarizability for 100 epochs on the entire dataset:
+# Train Polarizability for 100 epochs on the full QM40 split:
 ./run_chemprop_bg.sh Polarizability 100
-
-# Or using the alias:
-./run_property_bg.sh Polarizability 100
 ```
 
-To view live training progress in real time:
+That single command will:
+
+1. **Build a dedicated, isolated environment** for chemprop (a conda env named `chemprop`, or `.venv-chemprop/` if you don't use conda). It **never touches your `qpred` environment** — the old failure mode ("doesn't run in the qpred env") came from chemprop needing Python ≥ 3.10 while qpred ships a different Python.
+2. **Auto-install anything missing** in that env only: PyTorch (CUDA build on Linux via PyPI wheels) and `pip install -e ./chemprop`.
+3. Verify / generate the train/val/test splits in `compare/` (seed 42, QPred-matching).
+4. **Launch training in the background** (`nohup` + `disown`) so it keeps running after you close SSH.
+5. **Launch a progress monitor** that writes a clean, continuously-updating log with one line per finished epoch, plus a final summary including TEST-set MAE/MSE.
+
+Watch progress (clean, recommended):
+
 ```bash
-tail -f logs/Polarizability_latest.log
+tail -f logs/Polarizability_progress.log
 ```
 
----
+You will see lines like:
 
-## 2. VM Environment Setup
-
-### Option A: Using Conda (Recommended)
-
-```bash
-# 1. Create a conda environment with Python 3.11
-conda create -y -n qpred python=3.11
-conda activate qpred
-
-# 2. Install PyTorch with CUDA support (example for CUDA 12.1)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-
-# 3. Install Chemprop and its dependencies
-cd chemprop
-pip install -e .
-pip install -r requirements.txt
-pip install rdkit pandas numpy scikit-learn
-
-# 4. Verify installation & GPU availability
-python3 -c "import torch; print('CUDA available:', torch.cuda.is_available())"
-python3 -c "import chemprop; print('Chemprop version:', chemprop.__version__)"
+```
+[2026-09-16 14:22:31] Epoch  34/100 | val_loss=0.0456 | val_MAE=0.0342 | val_MSE=0.0021 | train_loss=0.0123 | best_val_MAE=0.0330 @ epoch 31
 ```
 
-### Option B: Using Python Virtual Environment (venv)
+> `val_MAE` / `val_MSE` are in the **original physical units** of the property (e.g. Bohr³ for Polarizability, Hartree for HOMO) — chemprop un-normalizes predictions before computing them, so they are directly comparable to the QPred physical MAE.
+
+Stop a training:
 
 ```bash
-cd chemprop
-python3 -m venv venv
-source venv/bin/activate
-
-pip install --upgrade pip
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install -e .
-pip install -r requirements.txt
-pip install rdkit pandas numpy scikit-learn
+./stop_chemprop.sh Polarizability
 ```
 
 ---
 
-## 3. Dataset & Splits Preparation
-
-The dataset splits match the QPred model exactly (Seed = 42, 80% train / 10% val / 10% test):
+## 2. Command Syntax
 
 ```bash
-# Navigate to the compare folder and generate split files if not already generated
-cd compare
-python3 create_split.py
-cd ..
+./run_chemprop_bg.sh <property_name> [num_epochs=100] [batch_size=64] [num_workers=2]
+
+# equivalent alias (kept for compatibility):
+./run_property_bg.sh <property_name> [num_epochs] [batch_size] [num_workers]
 ```
 
-This creates:
-- `compare/train.csv` (110,000 molecules)
-- `compare/val.csv` (10,000 molecules)
-- `compare/test.csv` (remaining molecules)
+Examples:
+
+```bash
+./run_chemprop_bg.sh Polarizability 100          # default batch 64
+./run_chemprop_bg.sh HOMO 500 64 4               # 500 epochs, batch 64, 4 dataloader workers
+./run_chemprop_bg.sh "spatial extent" 100        # quotes needed for names with spaces
+./run_chemprop_bg.sh "Internal_E(0K)" 100
+```
+
+Optional environment variables:
+
+```bash
+CHEMPROP_ENV_NAME=chemprop ./run_chemprop_bg.sh ...          # conda env name to use/create
+CHEMPROP_PYTHON=/usr/bin/python3.11 ./run_chemprop_bg.sh ... # python for venv creation
+TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 ./run_chemprop_bg.sh ...  # specific CUDA build
+```
+
+Multi-GPU selection:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ./run_chemprop_bg.sh Polarizability 100
+```
+
+> **Note on dataset size:** the script trains on the **entire split** (110,000 train / 10,000 val / 42,956 test molecules). `batch_size` is only the GPU mini-batch size, and `num_workers` only the dataloader parallelism.
 
 ---
 
-## 4. Background Training Script Usage
+## 3. Environment Notes (first run only)
 
-The script `run_chemprop_bg.sh` automatically:
-- Activates your conda environment (`qpred` or `chemprop`) or venv
-- Checks and verifies the train/val/test split files
-- Sets `PYTHONUNBUFFERED=1` so logs update in real-time
-- Executes Chemprop in the background via `nohup`
-- Disowns the process so closing the terminal / SSH will **not** kill training
-- Saves process PID in `logs/<property>.pid` for easy management
+The very first run downloads and installs PyTorch + chemprop into the dedicated env (one-time, ~10–20 min depending on bandwidth). Every later run starts in seconds.
 
-### Syntax:
+What the auto-bootstrap picks, in order:
+
+| Situation | Environment used |
+|---|---|
+| conda env `chemprop` already exists | reused as-is |
+| `.venv-chemprop/`, `venv/`, or `chemprop/venv/` exists (py ≥ 3.10) | reused as-is |
+| conda available | creates conda env `chemprop` (Python 3.11) |
+| no conda | creates `.venv-chemprop` from newest system Python ≥ 3.10 |
+
+Manual setup (if you ever prefer to do it yourself):
+
 ```bash
-./run_chemprop_bg.sh <property_name> [num_epochs] [batch_size]
+conda create -y -n chemprop python=3.11
+conda activate chemprop
+pip install torch                                   # or: pip install torch --index-url https://download.pytorch.org/whl/cu121
+cd chemprop && pip install -e . && cd ..
+python -c "import torch; print('CUDA available:', torch.cuda.is_available())"
+python -c "import chemprop; print('Chemprop', chemprop.__version__)"
 ```
 
-### Examples:
-```bash
-# 1. Train on Polarizability (100 epochs, batch size 32)
-./run_chemprop_bg.sh Polarizability 100 32
-
-# 2. Train on HOMO (150 epochs)
-./run_chemprop_bg.sh HOMO 150
-
-# 3. Train on spatial extent (use quotes for property names with spaces)
-./run_chemprop_bg.sh "spatial extent" 100 32
-
-# 4. Train on Internal Energy at 0K
-./run_chemprop_bg.sh "Internal_E(0K)" 100 32
-```
+> **Never** install chemprop into the `qpred` env: chemprop 2.x requires Python ≥ 3.10 and its pinned dependencies (lightning, torch ≥ 2.1, …) can break qpred's own environment. That's exactly why the bootstrap builds a separate one.
 
 ---
 
-## 5. Monitoring & Managing Background Training
+## 4. Dataset & Splits
 
-### Monitor Logs in Real-Time:
+Splits match QPred exactly (seed 42 via `np.random.permutation`, valid SMILES only, 110k train / 10k val / rest test). They are generated automatically if missing, or manually:
+
 ```bash
-# Follow the latest log for Polarizability:
-tail -f logs/Polarizability_latest.log
-
-# Or view the last 50 lines:
-tail -n 50 logs/Polarizability_latest.log
-
-# Check error log:
-cat logs/Polarizability_*.err
+cd compare && python create_split.py && cd ..
 ```
 
-### Check if Training is Still Running:
-```bash
-# Check by saved PID:
-ps -p $(cat logs/Polarizability.pid)
+This creates `compare/train.csv`, `compare/val.csv`, `compare/test.csv` (plus `*_ids.txt`).
 
-# Or check all active Chemprop training processes:
-pgrep -fl "chemprop.cli train"
+---
+
+## 5. Monitoring & Managing a Run
+
+All artifacts live in `logs/`:
+
+| File | Contents |
+|---|---|
+| `logs/<prop>_progress.log` | **Clean per-epoch progress + final summary (watch this)** |
+| `logs/<prop>_latest.log` | Raw chemprop output (symlink to the timestamped log) |
+| `logs/<prop>_<timestamp>.log` | Raw log of a specific run |
+| `logs/<prop>_monitor.err` | Errors from the progress monitor (should stay empty) |
+| `logs/<prop>.pid`, `logs/<prop>_monitor.pid` | PIDs of trainer / monitor |
+
+```bash
+tail -f logs/Polarizability_progress.log   # clean progress (one line per epoch)
+tail -f logs/Polarizability_latest.log     # raw chemprop output
+ps -p $(cat logs/Polarizability.pid)       # is it still running?
+pgrep -fl "chemprop"                       # all chemprop processes
+watch -n 1 nvidia-smi                      # GPU usage
+./stop_chemprop.sh Polarizability          # stop cleanly (SIGTERM, saves last state)
 ```
 
-### Monitor GPU and Resource Usage:
-```bash
-# Real-time GPU monitoring (updates every second):
-watch -n 1 nvidia-smi
+The progress log ends with a summary block: total epochs completed, best validation MAE and its epoch, and the final **TEST-set MAE/MSE** that chemprop prints after training. Per-molecule test predictions are saved automatically to:
 
-# Check CPU and RAM:
-htop
 ```
-
-### Stop / Terminate Training:
-```bash
-# Stop using the stored PID:
-kill $(cat logs/Polarizability.pid)
-
-# Force stop if needed:
-kill -9 $(cat logs/Polarizability.pid)
+checkpoints/<prop>/model_0/test_predictions.csv
 ```
 
 ---
 
 ## 6. Supported QM40 Target Properties
 
-All 13 quantum properties present in `train.csv`, `val.csv`, and `test.csv` can be trained directly:
+All 13 quantum properties present in the split CSVs:
 
-| # | Property Name in Script | Physical Meaning | Units |
+| # | Property Name | Physical Meaning | Units |
 |---|-------------------------|------------------|-------|
 | 1 | `Polarizability` | Polarizability (Benchmark Default) | Bohr³ |
 | 2 | `dipol_mom` | Dipole Moment | Debye |
@@ -182,70 +170,66 @@ All 13 quantum properties present in `train.csv`, `val.csv`, and `test.csv` can 
 
 ---
 
-## 7. Direct CLI Training Command (Alternative to Script)
+## 7. Post-Training Evaluation & QPred Comparison
 
-If you wish to run the Chemprop CLI command directly in your terminal:
+### Option A (fastest): use the predictions training already wrote
 
 ```bash
-python3 -m chemprop.cli train \
-    -i compare/train.csv compare/val.csv compare/test.csv \
-    --smiles-columns smile \
-    --target-columns Polarizability \
-    --task-type regression \
-    --output-dir checkpoints/Polarizability \
-    --epochs 100 \
-    --batch-size 32 \
-    --metrics mae mse \
-    --accelerator auto
+python compare/chemprop_qpred_style_mae.py \
+    --train-path compare/train.csv \
+    --test-path compare/test.csv \
+    --predictions-path checkpoints/Polarizability/model_0/test_predictions.csv \
+    --target-column Polarizability
 ```
 
----
+The script auto-detects the prediction column and joins on `Zinc_id` when available or on the `smile` column otherwise. It reports MAE / RMSE in both the **QPred-normalized convention** (train-set mean/MAD) and **physical units**.
 
-## 8. Post-Training Evaluation & Predictions
+### Option B: run `chemprop predict` yourself (produces `pred_0` layout)
 
-After training completes, the best model weights are saved at:
-`checkpoints/<property_name>/model_0/best.pt`
-
-### Step 1: Generate Test Predictions with Chemprop
 ```bash
-python3 -m chemprop.cli predict \
+python -m chemprop.cli.main predict \
     -i compare/test.csv \
     --smiles-columns smile \
     --model-paths checkpoints/Polarizability/model_0/best.pt \
     -o compare/chemprop_predictions.csv
 ```
 
-### Step 2: Compute QPred-Style Normalized MAE & Physical MAE
+> **Important:** the correct module invocation is `python -m chemprop.cli.main predict` (or just the `chemprop` console script). The older `python -m chemprop.cli train` form crashes because chemprop has no `cli/__main__.py`.
+
+Then compute the QPred-style MAE:
+
 ```bash
-python3 compare/chemprop_qpred_style_mae.py \
+python compare/chemprop_qpred_style_mae.py \
     --train-path compare/train.csv \
     --test-path compare/test.csv \
     --predictions-path compare/chemprop_predictions.csv \
-    --target-column Polarizability \
-    --id-column Zinc_id \
-    --prediction-column prediction
+    --target-column Polarizability
 ```
 
-### Step 3: Run Direct Side-by-Side Comparison against QPred
-Ensure `compare/qpred_predictions.csv` is present with columns `Zinc_id,actual,predicted`:
+### Side-by-side vs QPred
+
+Put QPred's test predictions in `compare/qpred_predictions.csv` with columns `Zinc_id,actual,predicted`, then:
+
 ```bash
-cd compare
-python3 compare_predictions.py
+cd compare && python compare_predictions.py && cd ..
 ```
 
 ---
 
-## 9. VM Best Practices & Tips
+## 8. Troubleshooting
 
-1. **Keep processes alive:** Always use `./run_chemprop_bg.sh` or `tmux`/`screen` when training over SSH.
-2. **Log rotation:** Each training run creates a timestamped log file `logs/<property>_<timestamp>.log` and symlinks `logs/<property>_latest.log` for convenience.
-3. **Multi-GPU selection:** If your VM has multiple GPUs, you can target a specific GPU by prefixing:
-   ```bash
-   CUDA_VISIBLE_DEVICES=0 ./run_chemprop_bg.sh Polarizability 100
-   ```
-4. **Resuming terminal after logout:**
-   Simply SSH back into the VM and run:
-   ```bash
-   cd chemprop-benchmark
-   tail -f logs/Polarizability_latest.log
-   ```
+| Symptom | Cause / Fix |
+|---|---|
+| First run takes long before epoch 1 appears | Normal: torch/chemprop install + featurization of 110k molecules. Check `tail -f logs/<prop>_latest.log`. |
+| `CUDA available: False` | CPU-only torch got installed. Reinstall with the right index: `TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 ./run_chemprop_bg.sh ...` (after `./stop_chemprop.sh` + deleting the env). |
+| CUDA OOM | Lower batch size: `./run_chemprop_bg.sh Polarizability 100 32`. |
+| Run won't start: "already running" | A previous run for that property is alive: `./stop_chemprop.sh <prop>` first. |
+| Wrong split files / want to re-split | Delete `compare/train.csv`, `compare/val.csv`, `compare/test.csv` and re-run (auto-regenerates with seed 42). |
+| Want a fresh environment | `conda env remove -n chemprop` (or `rm -rf .venv-chemprop`) and re-run the launcher. |
+| Monitor stopped but training alive | Monitor logs go to `logs/<prop>_monitor.err`; training is unaffected — check the raw log. |
+
+### Best practices
+
+1. Always launch through the script (or `tmux`/`screen`) when training over SSH — the script already detaches with `nohup` + `disown`.
+2. One training per property at a time; use different property names (or rename `checkpoints/<prop>`) for parallel runs on different GPUs.
+3. `num_workers > 0` speeds up dataloading on Linux VMs; if you see worker hangs, pass `0` as the 4th argument.

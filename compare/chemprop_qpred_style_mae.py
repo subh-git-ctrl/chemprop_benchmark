@@ -47,20 +47,42 @@ def load_and_merge(
     id_col: str,
     prediction_col: str,
 ) -> tuple[pd.DataFrame, float, float, str]:
-    """Load train/test/prediction files and align them by molecule ID."""
+    """Load train/test/prediction files and align them by molecule ID.
+
+    Supports both prediction file layouts:
+      - `chemprop predict` output:  full input columns + ``pred_0`` (has Zinc_id)
+      - `chemprop train` output (``test_predictions.csv``): only
+        ``smile,<target>`` columns -- in that case rows are joined on the
+        SMILES column and the prediction column (named after the target) is
+        renamed to ``prediction``.
+    """
     train_df = pd.read_csv(train_path)
     test_df = pd.read_csv(test_path)
     pred_df = pd.read_csv(predictions_path)
 
-    if id_col not in test_df.columns:
-        raise ValueError(f"Column '{id_col}' not found in test file: {test_path}")
-    if id_col not in pred_df.columns:
-        raise ValueError(f"Column '{id_col}' not found in predictions file: {predictions_path}")
     if target_col not in test_df.columns:
         raise ValueError(f"Column '{target_col}' not found in test file: {test_path}")
 
+    # ---- Resolve the join key: Zinc_id when available, else SMILES ----------
+    if id_col in test_df.columns and id_col in pred_df.columns:
+        join_col = id_col
+    elif "smile" in test_df.columns and "smile" in pred_df.columns:
+        join_col = "smile"
+        print(
+            f"Note: '{id_col}' not present in both files; joining on the "
+            "'smile' column instead (typical for test_predictions.csv "
+            "written automatically by `chemprop train`)."
+        )
+    else:
+        raise ValueError(
+            f"Neither '{id_col}' nor 'smile' found in both "
+            f"{test_path} (columns: {list(test_df.columns)}) and "
+            f"{predictions_path} (columns: {list(pred_df.columns)})"
+        )
+
+    # ---- Resolve the prediction column --------------------------------------
     if prediction_col is None or str(prediction_col).lower() in {"auto", "none", "default"}:
-        for candidate in ["prediction", "pred_0", "predicted", "predictions"]:
+        for candidate in ["prediction", "pred_0", "predicted", "predictions", target_col]:
             if candidate in pred_df.columns:
                 prediction_col = candidate
                 break
@@ -78,10 +100,16 @@ def load_and_merge(
 
     mean, mad = compute_mean_mad(train_df, target_col)
 
-    truth = test_df[[id_col, target_col]].copy()
-    preds = pred_df[[id_col, prediction_col]].copy()
+    truth = test_df[[join_col, target_col]].copy()
+    preds = pred_df[[join_col, prediction_col]].copy()
 
-    merged = truth.merge(preds, on=id_col, how='inner')
+    # When the prediction column reuses the target name (train-generated
+    # test_predictions.csv), rename it so it does not clash with the truth.
+    if prediction_col == target_col:
+        prediction_col = "prediction"
+        preds = preds.rename(columns={target_col: "prediction"})
+
+    merged = truth.merge(preds, on=join_col, how='inner')
 
     if len(merged) != len(test_df):
         print(
@@ -187,7 +215,11 @@ def main() -> None:
         "--prediction-column",
         type=str,
         default="auto",
-        help="Prediction column in the Chemprop predictions CSV. Auto-detects: prediction, pred_0, predicted, predictions.",
+        help=(
+            "Prediction column in the Chemprop predictions CSV. Auto-detects: "
+            "prediction, pred_0, predicted, predictions, or the target column "
+            "name (as used in test_predictions.csv written by `chemprop train`)."
+        ),
     )
     parser.add_argument(
         "--output-csv",
