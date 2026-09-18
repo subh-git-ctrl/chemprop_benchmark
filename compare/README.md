@@ -197,6 +197,8 @@ python scripts/predict.py --test_path ../compare/test.csv \
 
 ## Results Documentation
 
+📌 **Polarizability head-to-head result (final, units-audited): see [QPred_vs_chemprop_Polarizability.md](QPred_vs_chemprop_Polarizability.md)** — chemprop test MAE 1.7937 Bohr³ vs QPred 2.1953 Bohr³ (chemprop 18.3 % lower); QPred's printed "physical" 0.055991 was a scaler mis-indexing bug (used `dipol_mom`'s MAD).
+
 After training, document:
 
 1. **Chemprop Configuration**
