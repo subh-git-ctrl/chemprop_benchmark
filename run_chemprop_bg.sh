@@ -122,6 +122,62 @@ echo " [1/4] Setting up the dedicated chemprop environment"
 echo "=================================================================="
 
 # ------------------------------------------------------------------------------
+# 1b. Preflight disk guards
+#     Classic VM trap: data disks (e.g. /mnt) are NOT auto-mounted after a
+#     reboot unless they are listed in /etc/fstab. Conda then cannot see the
+#     existing 'chemprop' env, this script silently builds a NEW one on the
+#     small root disk, and the ~3 GB torch download dies with
+#     "[Errno 28] No space left on device". Catch that BEFORE downloading.
+# ------------------------------------------------------------------------------
+fs_avail_bytes()  { df -B1 --output=avail "$1" 2>/dev/null | tail -n 1 | tr -dc '0-9'; }
+fs_mount_target() { findmnt -rn -T "$1" -o TARGET 2>/dev/null | head -n 1; }
+human_gb()        { echo $(( ($1 + 1024*1024*1024 - 1) / (1024*1024*1024) )); }
+MIN_FREE_BYTES=$(( 12 * 1024 * 1024 * 1024 ))   # head-room for the torch CUDA build
+
+EXTRA_ENVS_DIRS=""
+if command -v conda &>/dev/null; then
+    EXTRA_ENVS_DIRS=$(conda config --show envs_dirs 2>/dev/null | sed -n 's/^[[:space:]]*-[[:space:]]*//p')
+fi
+
+UNMOUNTED_ENVS_DIR=""
+while IFS= read -r d; do
+    [ -z "$d" ] && continue
+    case "$d" in "$HOME"/*) continue ;; esac   # dirs under $HOME are on the root fs by design
+    if [ -d "$d" ] && [ "$(fs_mount_target "$d")" = "/" ]; then
+        UNMOUNTED_ENVS_DIR="$d"
+        break
+    fi
+done <<< "$EXTRA_ENVS_DIRS"
+
+if [ -n "$UNMOUNTED_ENVS_DIR" ]; then
+    ROOT_AVAIL=$(fs_avail_bytes "/")
+    echo "[Disk] WARNING: conda envs dir '$UNMOUNTED_ENVS_DIR' currently resolves to the"
+    echo "[Disk] ROOT filesystem — a data disk is probably NOT mounted (common after reboot)."
+    if [ -n "$ROOT_AVAIL" ] && [ "$ROOT_AVAIL" -lt "$MIN_FREE_BYTES" ]; then
+        echo "=================================================================="
+        echo " ERROR: only $(human_gb "$ROOT_AVAIL") GiB free on the root filesystem, and the"
+        echo " conda envs dir '$UNMOUNTED_ENVS_DIR' is not on a mounted data disk."
+        echo ""
+        echo " Your existing '$ENV_NAME' env (with torch already installed) is most"
+        echo " likely INTACT on the unmounted disk. Fix, then re-run this script:"
+        echo ""
+        echo "   1) findmnt /mnt              # empty output = NOT mounted"
+        echo "   2) lsblk -f                  # find the big data disk (e.g. /dev/sdb)"
+        echo "   3) sudo mount /dev/sdb /mnt  # use YOUR device name from lsblk"
+        echo "   4) conda env list            # '$ENV_NAME' should reappear"
+        echo ""
+        echo " Make it survive future reboots (one-time):"
+        echo "   sudo blkid /dev/sdb          # copy UUID=... and TYPE=..."
+        echo "   echo 'UUID=<your-uuid> /mnt <type> defaults,nofail 0 2' | sudo tee -a /etc/fstab"
+        echo ""
+        echo " Aborting instead of re-downloading ~3 GB of torch onto a nearly-full"
+        echo " root disk (which would end in '[Errno 28] No space left on device')."
+        echo "=================================================================="
+        exit 1
+    fi
+fi
+
+# ------------------------------------------------------------------------------
 # 2. Environment bootstrap — NEVER touches qpred
 # ------------------------------------------------------------------------------
 CONDA_SH=""
@@ -232,6 +288,35 @@ echo " [2/4] Checking dependencies (installs only what is missing)"
 echo "=================================================================="
 
 if ! "$PY_EXE" -c "$PY_FILTER; import torch" 2>/dev/null; then
+    # torch CUDA wheels: ~3 GB download + ~6 GB installed. Verify head-room on
+    # BOTH the env filesystem and the pip-cache filesystem BEFORE downloading,
+    # or pip dies mid-install with "[Errno 28] No space left on device".
+    ENV_FS_AVAIL=$(fs_avail_bytes "$(dirname "$PY_EXE")")
+    if [ -n "$ENV_FS_AVAIL" ] && [ "$ENV_FS_AVAIL" -lt "$MIN_FREE_BYTES" ]; then
+        echo "=================================================================="
+        echo " ERROR: only $(human_gb "$ENV_FS_AVAIL") GiB free on the filesystem holding the"
+        echo " chemprop env ($(dirname "$PY_EXE")). The torch CUDA build needs ~7+ GiB"
+        echo " plus pip cache. Free up space (or move the env to a bigger disk),"
+        echo " then re-run. Nothing was downloaded yet."
+        echo "=================================================================="
+        exit 1
+    fi
+    PIP_CACHE_EFF="${PIP_CACHE_DIR:-$HOME/.cache/pip}"
+    CACHE_PROBE="$PIP_CACHE_EFF"
+    while [ ! -d "$CACHE_PROBE" ] && [ "$CACHE_PROBE" != "/" ]; do
+        CACHE_PROBE=$(dirname "$CACHE_PROBE")
+    done
+    CACHE_FS_AVAIL=$(fs_avail_bytes "$CACHE_PROBE")
+    if [ -n "$CACHE_FS_AVAIL" ] && [ "$CACHE_FS_AVAIL" -lt $(( 4 * 1024 * 1024 * 1024 )) ]; then
+        echo "=================================================================="
+        echo " ERROR: only $(human_gb "$CACHE_FS_AVAIL") GiB free on the pip-cache filesystem"
+        echo " ($PIP_CACHE_EFF). The torch wheels are a ~3 GB download. Free up space"
+        echo " there, or point the cache at a bigger disk first, e.g.:"
+        echo "   mkdir -p /mnt/pip-cache && export PIP_CACHE_DIR=/mnt/pip-cache"
+        echo " then re-run. Nothing was downloaded yet."
+        echo "=================================================================="
+        exit 1
+    fi
     echo "[Setup] Installing PyTorch (Linux PyPI wheels bundle CUDA support)..."
     if [ -n "$TORCH_INDEX_URL" ]; then
         "$PY_EXE" -m pip install torch --index-url "$TORCH_INDEX_URL" || { echo "ERROR: torch install failed"; exit 1; }

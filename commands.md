@@ -30,10 +30,10 @@ tail -f logs/Polarizability_progress.log
 You will see lines like:
 
 ```
-[2026-09-16 14:22:31] Epoch  34/100 | val_loss=0.0456 | val_MAE=0.0342 | val_MSE=0.0021 | train_loss=0.0123 | best_val_MAE=0.0330 @ epoch 31
+[2026-09-16 14:22:31] Epoch  34/100 | val_loss=0.0456 | val_MAE=0.0342 (phys 2.5310) | val_MSE=0.0021 | train_loss=0.0123 | best_val_MAE=0.0330 (phys 2.4416) @ epoch 31
 ```
 
-> `val_MAE` / `val_MSE` are in the **original physical units** of the property (e.g. Bohr³ for Polarizability, Hartree for HOMO) — chemprop un-normalizes predictions before computing them, so they are directly comparable to the QPred physical MAE.
+> **Units:** chemprop computes per-epoch validation metrics in the **normalized (z-score) space** of the training targets (that is how it selects checkpoints), so `val_MAE` / `val_MSE` / `val_loss` are normalized. The monitor scrapes the target scaler chemprop prints at startup (`Train data: mean = [...] | std = [...]`) and shows the **physical** value next to each: `phys = normalized x train-std`. The **final TEST metrics and `test_predictions.csv` ARE in physical units** (chemprop de-normalizes in eval mode), so end-of-run numbers are directly comparable with QPred's physical MAE.
 
 Stop a training:
 
@@ -81,7 +81,7 @@ CUDA_VISIBLE_DEVICES=0 ./run_chemprop_bg.sh Polarizability 100
 
 ## 3. Environment Notes (first run only)
 
-The very first run downloads and installs PyTorch + chemprop into the dedicated env (one-time, ~10–20 min depending on bandwidth). Every later run starts in seconds.
+The very first run downloads and installs PyTorch + chemprop into the dedicated env (one-time, ~10–20 min depending on bandwidth). Every later run starts in seconds — **if the disk holding the env is mounted** (see the *VM reboot checklist* in Troubleshooting).
 
 What the auto-bootstrap picks, in order:
 
@@ -233,6 +233,35 @@ The script auto-detects the prediction columns (`predicted`/`pred_0`/target-name
 | Wrong split files / want to re-split | Delete `compare/train.csv`, `compare/val.csv`, `compare/test.csv` and re-run (auto-regenerates with seed 42). |
 | Want a fresh environment | `conda env remove -n chemprop` (or `rm -rf .venv-chemprop`) and re-run the launcher. |
 | Monitor stopped but training alive | Monitor logs go to `logs/<prop>_monitor.err`; training is unaffected — check the raw log. |
+| After a VM reboot: torch re-downloads / `[Errno 28] No space left on device` | Your data disk (e.g. `/mnt`, where the conda env lives) did not auto-mount, so conda can't see the existing env. Follow the **VM reboot checklist** below — do NOT delete anything. The launcher now aborts early with clear instructions instead of re-downloading onto the root disk. |
+
+### VM reboot checklist (data disk not mounted)
+
+Cloud data disks do not survive reboots unless they are listed in `/etc/fstab`. If your conda envs dir lives on one (e.g. `/mnt/conda/envs`), a reboot makes the `chemprop` env invisible and the launcher would rebuild it on the small root disk.
+
+```bash
+findmnt /mnt                      # empty output = NOT mounted
+lsblk -f                          # find the big data disk: note NAME, FSTYPE, UUID
+
+# ONLY while it is still unmounted, clean junk written under /mnt by the failed
+# attempt (this is on the root disk; the real env is on the disk itself):
+sudo rm -rf /mnt/conda /mnt/pip-cache
+rm -rf ~/.cache/pip               # pip cache on the root disk
+
+sudo mount /dev/sdX /mnt          # <-- use YOUR device name from lsblk
+ls /mnt/conda/envs                # 'chemprop' should be listed again
+
+# Make it permanent (survives future reboots):
+echo 'UUID=<uuid-from-lsblk> /mnt <fstype> defaults,nofail 0 2' | sudo tee -a /etc/fstab
+sudo mount -a                     # must print nothing and stay mounted
+conda env list                    # 'chemprop' visible again
+
+# Optional but recommended: keep the pip cache off the root disk too
+sudo mkdir -p /mnt/pip-cache && sudo chown $USER /mnt/pip-cache
+pip config set global.cache-dir /mnt/pip-cache
+```
+
+Then just re-run the launcher — it will find the existing env (`torch: already installed`) and start training with **zero re-downloads**.
 
 ### Best practices
 
