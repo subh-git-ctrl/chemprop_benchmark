@@ -9,18 +9,20 @@
 #   1. Builds/uses a DEDICATED Python environment for chemprop — it never
 #      touches your `qpred` environment (this was the root cause of the old
 #      "not running in the qpred env" failures: qpred has a different Python).
-#         - $CHEMPROP_ENV_DIR set (absolute path)   -> use/create the env THERE
-#         - elif $HOME/.conda/envs/chemprop exists  -> use it
-#         - elif a conda env named `chemprop` exists -> use it, but ONLY if it
-#            physically lives under $HOME (an env on any other disk is ignored)
-#         - elif conda is available                 -> create the env at the
-#            EXPLICIT prefix $HOME/.conda/envs/chemprop (py3.11), so conda's
-#            envs_dirs can never redirect it to another disk
-#         - else                                    -> create `.venv-chemprop`
-#            from the newest python3.10+ found on the system
-#      The env therefore lives on the home filesystem unless YOU point
-#      CHEMPROP_ENV_DIR at a path on a disk of your choice. This script never
-#      mounts anything, never names a device and never requires a data disk.
+#         - $CHEMPROP_ENV_DIR set (absolute path)      -> use/create the env THERE
+#         - else                                       -> use/create the env at
+#            the EXPLICIT prefix  <data-disk>/conda/envs/chemprop  (py3.11)
+#            where <data-disk> is $CHEMPROP_DATA_DISK (default /mnt — the big
+#            data disk YOUR mount script mounts there). Explicit -p creation
+#            means conda's envs_dirs can never redirect it elsewhere.
+#         - no conda on the box                        -> create `.venv-chemprop`
+#            in the repo from the newest python3.10+ found
+#      Safety: before creating anything, the launcher verifies that the data
+#      disk is REALLY mounted (i.e. <data-disk> is not just the root fs in
+#      disguise — the classic post-reboot trap) and aborts with a clear
+#      message telling you to run your disk-mount script if it is not. It
+#      never mounts anything itself and never names a device.
+#      The pip cache is also moved onto the data disk (<data-disk>/pip-cache).
 #   2. Auto-installs anything missing inside that env only:
 #         torch (CUDA build on Linux via PyPI wheels) + `pip install -e ./chemprop`
 #   3. Verifies/generates the train/val/test split files in compare/.
@@ -78,12 +80,12 @@ if [ $# -eq 0 ]; then
     echo "  $0 \"Internal_E(0K)\" 100"
     echo ""
     echo "Optional environment variables:"
-    echo "  CHEMPROP_ENV_DIR    absolute path where the env lives / gets created"
-    echo "                      (default: \$HOME/.conda/envs/\$CHEMPROP_ENV_NAME —"
-    echo "                       point it at a path on any disk YOU mounted,"
-    echo "                       wherever you like; the script itself never"
-    echo "                       mounts anything and never touches other disks)"
-    echo "  CHEMPROP_ENV_NAME   env name for the default home location (default: chemprop)"
+    echo "  CHEMPROP_DATA_DISK  mountpoint of your big data disk (default: /mnt)"
+    echo "                      — the env goes to <data-disk>/conda/envs/<name>"
+    echo "                      and the pip cache to <data-disk>/pip-cache"
+    echo "  CHEMPROP_ENV_DIR    absolute path overriding the whole env location"
+    echo "                      (wins over CHEMPROP_DATA_DISK; any disk you like)"
+    echo "  CHEMPROP_ENV_NAME   env name for the default location (default: chemprop)"
     echo "  CHEMPROP_PYTHON     python executable for venv     (e.g. /usr/bin/python3.11)"
     echo "  TORCH_INDEX_URL     pip index for torch            (e.g. https://download.pytorch.org/whl/cu121)"
     echo "=================================================================="
@@ -134,14 +136,18 @@ echo " [1/4] Setting up the dedicated chemprop environment"
 echo "=================================================================="
 
 # ------------------------------------------------------------------------------
-# 1b. Resolve WHERE the chemprop env will live + preflight disk-space guard
-#     Policy: the env lives on the HOME filesystem by default, created at an
-#     EXPLICIT prefix so conda's envs_dirs can never redirect it elsewhere.
-#     This script NEVER mounts anything, never names a device and never
-#     requires a separate data disk. To place the env on a disk of YOUR
-#     choice, export CHEMPROP_ENV_DIR=/path/on/that/disk.
+# 1b. Resolve WHERE the chemprop env will live + preflight guards
+#     Policy: the env lives on the BIG DATA DISK your mount script puts at
+#     $CHEMPROP_DATA_DISK (default /mnt), created at the EXPLICIT prefix
+#     <data-disk>/conda/envs/<name> so conda's envs_dirs can never redirect
+#     it elsewhere. This script never mounts anything and never names a
+#     device — mounting is your mount script's job; the launcher only
+#     VERIFIES the disk is really mounted and aborts safely if it is not
+#     (otherwise the env would silently land on the small root fs — the
+#     classic post-reboot trap that once killed a run with '[Errno 28]').
 # ------------------------------------------------------------------------------
 fs_avail_bytes()  { df -B1 --output=avail "$1" 2>/dev/null | tail -n 1 | tr -dc '0-9'; }
+fs_source()       { df --output=source "$1" 2>/dev/null | tail -n 1; }
 human_gb()        { echo $(( ($1 + 1024*1024*1024 - 1) / (1024*1024*1024) )); }
 MIN_ENV_FREE_BYTES=$(( 10 * 1024 * 1024 * 1024 ))    # torch build + chemprop deps head-room
 MIN_CACHE_FREE_BYTES=$(( 4 * 1024 * 1024 * 1024 ))   # pip wheel cache during install
@@ -170,6 +176,7 @@ for v in "$VENV_DIR" "$SCRIPT_DIR/venv" "$SCRIPT_DIR/chemprop/venv"; do
 done
 
 # --- resolve the env prefix ---
+DATA_ROOT="${CHEMPROP_DATA_DISK:-/mnt}"
 if [ -n "${CHEMPROP_ENV_DIR:-}" ]; then
     case "$CHEMPROP_ENV_DIR" in
         /*) ENV_PREFIX="$CHEMPROP_ENV_DIR" ;;
@@ -179,29 +186,51 @@ if [ -n "${CHEMPROP_ENV_DIR:-}" ]; then
     ENV_PREFIX="$(cd "$(dirname "$ENV_PREFIX")" 2>/dev/null && pwd)/$(basename "$ENV_PREFIX")"
     echo "[Disk] CHEMPROP_ENV_DIR override active — env prefix: $ENV_PREFIX"
 else
-    ENV_PREFIX="$HOME/.conda/envs/$ENV_NAME"
+    ENV_PREFIX="$DATA_ROOT/conda/envs/$ENV_NAME"
+    # HARD GUARD: <data-disk> must be a real mounted filesystem, not the root
+    # fs in disguise (that happens whenever the data disk is not mounted, e.g.
+    # after a reboot — then everything written "under /mnt" lands on /).
+    SRC_ENV="$(fs_source "$ENV_PREFIX")"
+    SRC_ROOT="$(fs_source /)"
+    if [ -n "$SRC_ENV" ] && [ -n "$SRC_ROOT" ] && [ "$SRC_ENV" = "$SRC_ROOT" ]; then
+        echo "=================================================================="
+        echo " ERROR: the data disk is NOT mounted at $DATA_ROOT right now —"
+        echo " $ENV_PREFIX currently resolves to the ROOT filesystem."
+        echo ""
+        echo " Run your disk-mount script first (the one that mounts the big"
+        echo " data disk at $DATA_ROOT), then re-run this launcher."
+        echo ""
+        echo " Aborting instead of silently building the env on the small root"
+        echo " disk — that is exactly how the '[Errno 28] No space left on"
+        echo " device' failure happened before. Nothing was written."
+        echo "=================================================================="
+        exit 1
+    fi
+    echo "[Disk] Env prefix (data disk): $ENV_PREFIX"
 fi
 
-# --- a NAMED conda env is reused ONLY if it physically lives under $HOME.
-#     An env sitting on some other disk is ignored: this script never uses a
-#     disk you did not explicitly choose via CHEMPROP_ENV_DIR. ---
-NAMED_ENV_PATH=""
-if [ -n "$CONDA_SH" ] && [ "$(basename "$ENV_PREFIX")" = "$ENV_NAME" ]; then
-    NAMED_ENV_PATH="$(conda env list 2>/dev/null | awk -v n="$ENV_NAME" '$1 == n && NF >= 2 {print $NF}')"
-    [ "$NAMED_ENV_PATH" = "$ENV_PREFIX" ] && NAMED_ENV_PATH=""   # same dir the prefix check already covers
+# --- a conda env named $ENV_NAME that does NOT live at the prefix is
+#     IGNORED (policy: the managed env lives at the prefix). ---
+if [ -n "$CONDA_SH" ]; then
+    NAMED_ELSEWHERE="$(conda env list 2>/dev/null | awk -v n="$ENV_NAME" '$1 == n && NF >= 2 {print $NF}' | head -n 1)"
+    if [ -n "$NAMED_ELSEWHERE" ] && [ "$NAMED_ELSEWHERE" != "$ENV_PREFIX" ]; then
+        echo "[Env] Note: found conda env '$ENV_NAME' at $NAMED_ELSEWHERE — not the managed prefix."
+        echo "[Env]       Ignoring it (policy: the env lives at $ENV_PREFIX)."
+        echo "[Env]       To use that exact path instead:  CHEMPROP_ENV_DIR=$NAMED_ELSEWHERE ./run_chemprop_bg.sh ..."
+    fi
 fi
-NAMED_ENV_REUSABLE=0
-case "$NAMED_ENV_PATH" in
-    "$HOME"/*) NAMED_ENV_REUSABLE=1 ;;
-    "")
-        ;;
-    *)
-        echo "[Env] Note: a conda env '$ENV_NAME' exists at $NAMED_ENV_PATH (outside \$HOME)."
-        echo "[Env]       Ignoring it — this script keeps the env under \$HOME unless you"
-        echo "[Env]       explicitly choose that path:  CHEMPROP_ENV_DIR=$NAMED_ENV_PATH"
-        NAMED_ENV_PATH=""
-        ;;
-esac
+
+# --- pip cache: move it onto the data disk too (unless user set it) ---
+if [ -z "${PIP_CACHE_DIR:-}" ]; then
+    DATA_CACHE="$DATA_ROOT/pip-cache"
+    SRC_CACHE="$(fs_source "$DATA_CACHE")"
+    SRC_ROOT2="$(fs_source /)"
+    if [ -n "$SRC_CACHE" ] && [ -n "$SRC_ROOT2" ] && [ "$SRC_CACHE" != "$SRC_ROOT2" ] \
+       && mkdir -p "$DATA_CACHE" 2>/dev/null && [ -w "$DATA_CACHE" ]; then
+        export PIP_CACHE_DIR="$DATA_CACHE"
+        echo "[Disk] pip cache -> $DATA_CACHE (data disk)"
+    fi
+fi
 
 # --- effective creation target: prefix when conda (or an explicit override),
 #     repo venv otherwise ---
@@ -212,7 +241,7 @@ else
 fi
 
 # --- space guard: runs ONLY if a fresh env would actually be created ---
-if ! dir_has_env "$ENV_PREFIX" && [ "$VENV_EXISTS" -eq 0 ] && [ "$NAMED_ENV_REUSABLE" -eq 0 ]; then
+if ! dir_has_env "$ENV_PREFIX" && [ "$VENV_EXISTS" -eq 0 ]; then
     TARGET_AVAIL=$(fs_avail_bytes "$ENV_TARGET")
     if [ -n "$TARGET_AVAIL" ] && [ "$TARGET_AVAIL" -lt "$MIN_ENV_FREE_BYTES" ]; then
         echo "=================================================================="
@@ -222,7 +251,7 @@ if ! dir_has_env "$ENV_PREFIX" && [ "$VENV_EXISTS" -eq 0 ] && [ "$NAMED_ENV_REUS
         echo " The PyTorch build + chemprop dependencies need ~10 GiB while"
         echo " installing. Free up space there first (e.g. 'pip cache purge',"
         echo " 'conda clean --all', old checkpoints), or point the env at any"
-        echo " path with room — on a disk YOU mounted wherever you like:"
+        echo " path with room:"
         echo ""
         echo "   export CHEMPROP_ENV_DIR=/your/mounted/path/envs/chemprop"
         echo ""
@@ -234,13 +263,13 @@ if ! dir_has_env "$ENV_PREFIX" && [ "$VENV_EXISTS" -eq 0 ] && [ "$NAMED_ENV_REUS
 fi
 
 # ------------------------------------------------------------------------------
-# 2. Environment bootstrap — NEVER touches qpred; env stays under $HOME
-#    unless CHEMPROP_ENV_DIR says otherwise
+# 2. Environment bootstrap — NEVER touches qpred; env lives on the data disk
+#    (default) or wherever CHEMPROP_ENV_DIR points
 # ------------------------------------------------------------------------------
 ACTIVATED=0
 
 if dir_has_env "$ENV_PREFIX"; then
-    # --- reuse the env at the resolved prefix (default home path or override) ---
+    # --- reuse the env at the resolved prefix ---
     if [ -n "$CONDA_SH" ]; then
         source "$CONDA_SH"
         conda activate "$ENV_PREFIX"
@@ -250,12 +279,6 @@ if dir_has_env "$ENV_PREFIX"; then
         source "$ENV_PREFIX/bin/activate" 2>/dev/null || export PATH="$ENV_PREFIX/bin:$PATH"
     fi
     echo "[Env] Using existing environment: $ENV_PREFIX"
-    ACTIVATED=1
-elif [ "$NAMED_ENV_REUSABLE" -eq 1 ]; then
-    # --- reuse an existing named conda env that lives under $HOME ---
-    source "$CONDA_SH"
-    conda activate "$ENV_NAME"
-    echo "[Env] Using existing conda environment: $ENV_NAME ($NAMED_ENV_PATH)"
     ACTIVATED=1
 elif [ "$VENV_EXISTS" -eq 1 ]; then
     # --- reuse existing venv ---
@@ -363,7 +386,7 @@ if ! "$PY_EXE" -c "$PY_FILTER; import torch" 2>/dev/null; then
         echo " ERROR: only $(human_gb "$CACHE_FS_AVAIL") GiB free on the pip-cache filesystem"
         echo " ($PIP_CACHE_EFF). The torch wheels are a ~3 GB download. Free up space"
         echo " there, or point the cache at any path with room first, e.g.:"
-        echo "   export PIP_CACHE_DIR='$CHEMPROP_ENV_DIR/pip-cache'"
+        echo "   export PIP_CACHE_DIR='${CHEMPROP_DATA_DISK:-/mnt}/pip-cache'"
         echo " then re-run. Nothing was downloaded yet."
         echo "=================================================================="
         exit 1
