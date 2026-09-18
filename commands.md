@@ -15,7 +15,7 @@ chmod +x run_chemprop_bg.sh run_property_bg.sh stop_chemprop.sh
 
 That single command will:
 
-1. **Build a dedicated, isolated environment** for chemprop (a conda env named `chemprop`, or `.venv-chemprop/` if you don't use conda). It **never touches your `qpred` environment** — the old failure mode ("doesn't run in the qpred env") came from chemprop needing Python ≥ 3.10 while qpred ships a different Python.
+1. **Build a dedicated, isolated environment** for chemprop — created at an **explicit prefix under your home directory** (`~/.conda/envs/chemprop`), or `.venv-chemprop/` if you don't use conda. It **never touches your `qpred` environment** (the old failure mode: chemprop needs Python ≥ 3.10 while qpred ships a different Python), and it **never requires a separate data disk** — no mounting, no fstab, no device names.
 2. **Auto-install anything missing** in that env only: PyTorch (CUDA build on Linux via PyPI wheels) and `pip install -e ./chemprop`.
 3. Verify / generate the train/val/test splits in `compare/` (seed 42, QPred-matching).
 4. **Launch training in the background** (`nohup` + `disown`) so it keeps running after you close SSH.
@@ -64,8 +64,9 @@ Examples:
 Optional environment variables:
 
 ```bash
-CHEMPROP_ENV_NAME=chemprop ./run_chemprop_bg.sh ...          # conda env name to use/create
-CHEMPROP_PYTHON=/usr/bin/python3.11 ./run_chemprop_bg.sh ... # python for venv creation
+CHEMPROP_ENV_DIR=/abs/path/envs/chemprop ./run_chemprop_bg.sh ...  # env location — any disk YOU mounted, wherever you like
+CHEMPROP_ENV_NAME=chemprop ./run_chemprop_bg.sh ...                # env name for the default home location
+CHEMPROP_PYTHON=/usr/bin/python3.11 ./run_chemprop_bg.sh ...       # python for venv creation
 TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 ./run_chemprop_bg.sh ...  # specific CUDA build
 ```
 
@@ -81,16 +82,19 @@ CUDA_VISIBLE_DEVICES=0 ./run_chemprop_bg.sh Polarizability 100
 
 ## 3. Environment Notes (first run only)
 
-The very first run downloads and installs PyTorch + chemprop into the dedicated env (one-time, ~10–20 min depending on bandwidth). Every later run starts in seconds — **if the disk holding the env is mounted** (see the *VM reboot checklist* in Troubleshooting).
+The very first run downloads and installs PyTorch + chemprop into the dedicated env (one-time, ~10–20 min depending on bandwidth). Every later run starts in seconds — the env lives **under your home directory by default**, so there is nothing to re-mount after a reboot.
 
 What the auto-bootstrap picks, in order:
 
 | Situation | Environment used |
 |---|---|
-| conda env `chemprop` already exists | reused as-is |
-| `.venv-chemprop/`, `venv/`, or `chemprop/venv/` exists (py ≥ 3.10) | reused as-is |
-| conda available | creates conda env `chemprop` (Python 3.11) |
-| no conda | creates `.venv-chemprop` from newest system Python ≥ 3.10 |
+| `CHEMPROP_ENV_DIR` set | created/reused at exactly that path (any disk you mounted, wherever you like) |
+| `~/.conda/envs/chemprop` exists | reused as-is |
+| a conda env `chemprop` exists **under `$HOME`** | reused as-is |
+| conda available | created at the **explicit prefix** `~/.conda/envs/chemprop` (Python 3.11) — conda's `envs_dirs` can never redirect it to another disk |
+| no conda | creates `.venv-chemprop` in the repo from newest system Python ≥ 3.10 |
+
+> A `chemprop` env that lives on some **other** disk (outside `$HOME`) is **ignored** by the launcher — it will not silently train from an env on a disk you did not choose. To use exactly that path anyway, run with `CHEMPROP_ENV_DIR=/that/path`.
 
 Manual setup (if you ever prefer to do it yourself):
 
@@ -231,37 +235,33 @@ The script auto-detects the prediction columns (`predicted`/`pred_0`/target-name
 | CUDA OOM | Lower batch size: `./run_chemprop_bg.sh Polarizability 100 32`. |
 | Run won't start: "already running" | A previous run for that property is alive: `./stop_chemprop.sh <prop>` first. |
 | Wrong split files / want to re-split | Delete `compare/train.csv`, `compare/val.csv`, `compare/test.csv` and re-run (auto-regenerates with seed 42). |
-| Want a fresh environment | `conda env remove -n chemprop` (or `rm -rf .venv-chemprop`) and re-run the launcher. |
+| Want a fresh environment | `conda env remove -p ~/.conda/envs/chemprop` (or `rm -rf .venv-chemprop`, or delete your `CHEMPROP_ENV_DIR` path) and re-run the launcher. |
 | Monitor stopped but training alive | Monitor logs go to `logs/<prop>_monitor.err`; training is unaffected — check the raw log. |
-| After a VM reboot: torch re-downloads / `[Errno 28] No space left on device` | Your data disk (e.g. `/mnt`, where the conda env lives) did not auto-mount, so conda can't see the existing env. Follow the **VM reboot checklist** below — do NOT delete anything. The launcher now aborts early with clear instructions instead of re-downloading onto the root disk. |
+| `[Errno 28] No space left on device` / low disk | The launcher pre-checks **~10 GiB** on the env filesystem and **~4 GiB** on the pip-cache filesystem *before* downloading anything, and aborts with instructions when either is short. Free up space (`pip cache purge`, `conda clean --all`, old checkpoints) or `export CHEMPROP_ENV_DIR=/path/with/room` (any disk you mounted, wherever you like) and re-run. Nothing is downloaded when the check fails. |
 
-### VM reboot checklist (data disk not mounted)
+### Where the environment lives (disk-space policy)
 
-Cloud data disks do not survive reboots unless they are listed in `/etc/fstab`. If your conda envs dir lives on one (e.g. `/mnt/conda/envs`), a reboot makes the `chemprop` env invisible and the launcher would rebuild it on the small root disk.
+The chemprop env is created at an **explicit prefix under your home directory** (`~/.conda/envs/chemprop`). Because the path is explicit, conda settings such as `envs_dirs` can never redirect it to another disk, and **no data disk, mounting, or fstab work is involved** — an env under `$HOME` is always visible, including after a VM reboot.
+
+Disk-space needs on the **first** run only:
+
+| Filesystem | Free space required | When checked |
+|---|---|---|
+| Where the env is created | ~10 GiB | before any download |
+| Pip cache (`~/.cache/pip` or `$PIP_CACHE_DIR`) | ~4 GiB | before any download |
+
+If either check fails, the launcher aborts with instructions and downloads **nothing**. After a successful install it runs `pip cache purge` automatically, reclaiming ~2–3 GB.
+
+To keep the env on a different disk instead — one **you** mounted at any path you like — export its location once:
 
 ```bash
-findmnt /mnt                      # empty output = NOT mounted
-lsblk -f                          # find the big data disk: note NAME, FSTYPE, UUID
-
-# ONLY while it is still unmounted, clean junk written under /mnt by the failed
-# attempt (this is on the root disk; the real env is on the disk itself):
-sudo rm -rf /mnt/conda /mnt/pip-cache
-rm -rf ~/.cache/pip               # pip cache on the root disk
-
-sudo mount /dev/sdX /mnt          # <-- use YOUR device name from lsblk
-ls /mnt/conda/envs                # 'chemprop' should be listed again
-
-# Make it permanent (survives future reboots):
-echo 'UUID=<uuid-from-lsblk> /mnt <fstype> defaults,nofail 0 2' | sudo tee -a /etc/fstab
-sudo mount -a                     # must print nothing and stay mounted
-conda env list                    # 'chemprop' visible again
-
-# Optional but recommended: keep the pip cache off the root disk too
-sudo mkdir -p /mnt/pip-cache && sudo chown $USER /mnt/pip-cache
-pip config set global.cache-dir /mnt/pip-cache
+export CHEMPROP_ENV_DIR=/your/mounted/path/envs/chemprop   # any empty dir with ≥ 10 GiB free
+./run_chemprop_bg.sh Polarizability 100
 ```
 
-Then just re-run the launcher — it will find the existing env (`torch: already installed`) and start training with **zero re-downloads**.
+The launcher then reuses exactly that prefix on every later run (put the `export` in `~/.bashrc` to make it permanent). The script itself never mounts, unmounts, or names any device — the disk and its mount point are entirely your choice.
+
+After a VM reboot: nothing special to do for the default `$HOME` env — just re-run the launcher. If you placed the env on a separate disk, make sure that disk is available at the same path first (that disk's mount policy is yours; the script only ever uses the path you gave it).
 
 ### Best practices
 
