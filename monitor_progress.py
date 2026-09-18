@@ -7,10 +7,21 @@ It polls two sources, in order of preference:
   1. Lightning's CSVLogger output written by chemprop:
          <checkpoint-dir>/**/trainer_logs/version_*/metrics.csv
      Columns typically include: epoch, step, train_loss, val_loss, val/mae, val/mse
-     (all metric values are on the ORIGINAL / physical scale, because chemprop's
-      regression predictor un-normalizes predictions before computing metrics).
   2. Fallback: regex-scanning the raw training log produced by the tqdm
-     progress bar (used only if tensorboard is installed so no metrics.csv exists).
+     progress bar (used only if no metrics.csv exists).
+
+SCALE NOTES (verified against chemprop 2.3.1 source, cli/train.py + nn/transforms.py):
+  - train_loss / val_loss / val_MAE / val_MSE are in NORMALIZED (z-score) units:
+    chemprop standardizes regression targets with the scaler fit on the training
+    set and keeps training+validation in that space so checkpoint selection is
+    consistent. (UnscaleTransform is identity while in training mode, which
+    includes validation-by-design.)
+  - The FINAL test metrics (test/mae, test/rmse, ...) and the saved
+    test_predictions.csv ARE in original physical units (eval mode ->
+    de-normalized), so they are directly comparable with other models.
+  - If the 'Train data: mean = ... | std = ...' line is found in the raw log,
+    this monitor additionally reports val_MAE in physical units:
+    physical = normalized * std.
 
 For every completed validation epoch it appends ONE line like:
 
@@ -139,6 +150,41 @@ def read_metrics_from_raw_log(path: str, max_bytes: int = 4_000_000) -> dict[int
 
 TEST_METRIC_RE = re.compile(r"test/(mae|rmse|mse):\s*([-+0-9.eE]+)")
 
+SCALER_RE = re.compile(
+    r"Train data.*?mean\s*=\s*\[([^\]]+)\]\s*\|\s*std\s*=\s*\[([^\]]+)\]"
+)
+_FLOAT_RE = re.compile(r"[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?")
+
+
+def _first_float(s: str) -> float | None:
+    m = _FLOAT_RE.search(s)
+    return float(m.group(0)) if m else None
+
+
+def find_target_scaler(raw_log: str) -> tuple[float, float] | None:
+    """
+    Scrape the target scaler chemprop logs during setup, e.g.:
+
+        Train data: mean = [218.15937498] | std = [73.98378963]
+
+    Returns (mean, std) of the first target column, or None if not found.
+    Physical value = normalized value * std.
+    """
+    try:
+        with open(raw_log, "r", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+    hits = SCALER_RE.findall(content)
+    if not hits:
+        return None
+    mean_s, std_s = hits[-1]
+    mean = _first_float(mean_s)
+    std = _first_float(std_s)
+    if mean is None or std is None or std <= 0:
+        return None
+    return mean, std
+
 
 def find_test_metrics(raw_log: str) -> dict[str, float]:
     """Scrape 'test/mae: 0.1234' style lines chemprop prints at the end."""
@@ -185,8 +231,11 @@ def main() -> None:
         f.write(f" Target  : {args.epochs} epochs   |   Trainer PID: {args.pid}\n")
         f.write(f" Raw log : {args.run_log}\n")
         f.write(
-            " Note    : val_MAE / val_MSE are on the original (physical) scale\n"
-            "           of the property, computed by chemprop on the validation split.\n"
+            " Note    : val_MAE / val_MSE / val_loss are in NORMALIZED (z-score)\n"
+            "           units used internally by chemprop. Once chemprop logs the\n"
+            "           target scaler, this monitor also prints val_MAE in PHYSICAL\n"
+            "           units (phys = norm x train-std). The final TEST metrics at\n"
+            "           the end of this file ARE in physical units.\n"
         )
         f.write("=" * 100 + "\n")
         f.write(f"[{now_str()}] Waiting for the first epoch to finish "
@@ -198,6 +247,19 @@ def main() -> None:
     best_epoch: int | None = None
     start = time.time()
     heartbeat_written = False
+
+    # Target scaler (mean, std) parsed from the raw log once chemprop logs it.
+    scaler: tuple[float, float] | None = None
+    scaler_announced = False
+
+    def phys(v: float | None) -> float | None:
+        if v is None or scaler is None:
+            return None
+        return v * scaler[1]
+
+    def phys_txt(v: float | None) -> str:
+        p = phys(v)
+        return f" (phys {p:.4f})" if p is not None else ""
 
     def poll_sources() -> dict[int, dict[str, float]]:
         csv_path = latest_metrics_csv(args.checkpoint_dir)
@@ -216,12 +278,13 @@ def main() -> None:
             best_mae, best_epoch = val_mae, epoch
         best_txt = ""
         if best_mae is not None and best_epoch is not None:
-            best_txt = f" | best_val_MAE={fmt(best_mae)} @ epoch {best_epoch + 1}"
+            best_txt = (f" | best_val_MAE={fmt(best_mae)}{phys_txt(best_mae)}"
+                        f" @ epoch {best_epoch + 1}")
         with open(out_path, "a") as f:
             f.write(
                 f"[{now_str()}] Epoch {epoch + 1:>4}/{args.epochs}"
                 f" | val_loss={fmt(m.get('val_loss'))}"
-                f" | val_MAE={fmt(m.get('val/mae'))}"
+                f" | val_MAE={fmt(m.get('val/mae'))}{phys_txt(m.get('val/mae'))}"
                 f" | val_MSE={fmt(m.get('val/mse'))}"
                 f" | train_loss={fmt(m.get('train_loss'))}"
                 f"{best_txt}\n"
@@ -239,6 +302,18 @@ def main() -> None:
 
     while True:
         data = poll_sources()
+
+        # Detect the target scaler once chemprop logs it (early in setup)
+        if scaler is None and os.path.exists(args.run_log):
+            scaler = find_target_scaler(args.run_log)
+            if scaler is not None and not scaler_announced:
+                with open(out_path, "a") as f:
+                    f.write(f"[{now_str()}] Scaler detected: mean={scaler[0]:.4f}, "
+                            f"std={scaler[1]:.4f} -> val_MAE shown as norm + "
+                            f"physical (phys = norm x {scaler[1]:.4f}); "
+                            "final TEST metrics are physical.\n")
+                    f.flush()
+                scaler_announced = True
 
         # Write any newly-completed epochs that carry validation results
         for epoch in sorted(data.keys()):
@@ -287,12 +362,19 @@ def main() -> None:
         f.write(f"  Epochs with validation metrics recorded : {last_written + 1} "
                 f"of {args.epochs} planned\n")
         if best_mae is not None and best_epoch is not None:
-            f.write(f"  Best validation MAE (physical units)     : {best_mae:.6f} "
-                    f"@ epoch {best_epoch + 1}\n")
+            best_phys = phys(best_mae)
+            if best_phys is not None:
+                f.write(f"  Best validation MAE                      : {best_mae:.6f} "
+                        f"(normalized) = {best_phys:.6f} (physical) "
+                        f"@ epoch {best_epoch + 1}\n")
+            else:
+                f.write(f"  Best validation MAE (normalized units)   : {best_mae:.6f} "
+                        f"@ epoch {best_epoch + 1}\n")
         else:
             f.write("  No validation metrics were recorded — check the raw log / .err file.\n")
         if test_metrics:
-            f.write("  Final TEST-set metrics (from chemprop, physical units):\n")
+            f.write("  Final TEST-set metrics (from chemprop, PHYSICAL units - ")
+            f.write("directly comparable with QPred):\n")
             for k in sorted(test_metrics):
                 f.write(f"    {k}: {test_metrics[k]:.6f}\n")
             f.write("  -> Per-molecule test predictions: "
